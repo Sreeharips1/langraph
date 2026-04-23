@@ -11,6 +11,10 @@ from groq import Groq
 from langgraph.graph import StateGraph
 from fastapi.middleware.cors import CORSMiddleware
 
+from sqlalchemy import create_engine, Column, String, Integer, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
 load_dotenv()
 
 app = FastAPI()
@@ -30,6 +34,54 @@ app.add_middleware(
 # GROQ
 # =============================
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# =============================
+# DATABASE
+# =============================
+DATABASE_URL = "postgresql://postgres:sreehari30@localhost:5432/langgraph"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class Interaction(Base):
+    __tablename__ = "interactions"
+
+    id = Column(Integer, primary_key=True)
+    hcp_name = Column(String)
+    attendees = Column(Text)
+    topics = Column(Text)
+    sentiment = Column(String)
+    outcomes = Column(Text)
+    follow_up = Column(Text)
+    summary = Column(Text)
+    materials_shared = Column(Text)
+    samples = Column(Text)
+    date = Column(String)
+    time = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+def save_to_db(data):
+    db = SessionLocal()
+
+    interaction = Interaction(
+        hcp_name=data.get("hcp_name"),
+        attendees=", ".join(data.get("attendees", [])),
+        topics=data.get("topics"),
+        sentiment=data.get("sentiment"),
+        outcomes=data.get("outcomes"),
+        follow_up=data.get("follow_up"),
+        summary=data.get("summary"),
+        materials_shared=", ".join(data.get("materials_shared", [])),
+        samples=", ".join(data.get("samples", [])),
+        date=data.get("date"),
+        time=data.get("time"),
+    )
+
+    db.add(interaction)
+    db.commit()
+    db.close()
 
 # =============================
 # GLOBAL STATE
@@ -52,46 +104,78 @@ class ChatRequest(BaseModel):
     message: str
 
 # =============================
-# UTIL FUNCTIONS
+# RULE BASED EXTRACTION
 # =============================
 
-def normalize_attendees(data):
-    attendees = data.get("attendees")
+def extract_hcp(text):
+    text = text.lower()
 
-    if isinstance(attendees, str):
-        attendees = re.split(r"\band\b|,", attendees)
+    dr = re.search(r"dr\.?\s*[a-z]+", text)
+    if dr:
+        return dr.group().title()
 
-    if isinstance(attendees, list):
-        cleaned = []
-        for person in attendees:
-            person = person.strip()
-            if person.lower() == "me":
-                cleaned.append("Self")
-            else:
-                cleaned.append(person.title())
+    match = re.search(r"(met|visited|consulted)\s+([a-z]+)", text)
+    if match:
+        return match.group(2).title()
 
-        data["attendees"] = cleaned
-
-    return data
+    return None
 
 
-def normalize_list(value):
-    if isinstance(value, str):
-        return [v.strip() for v in value.split(",")]
-    return value if isinstance(value, list) else []
+def extract_attendees(text, hcp):
+    text = text.lower()
+
+    attendees = []
+
+    # CASE 1: "with ..."
+    match = re.search(r"with\s+(.+)", text)
+    if match:
+        names = re.split(r",|and", match.group(1))
+        attendees += [n.strip().title() for n in names if n.strip()]
+
+    # CASE 2: first word before "met"
+    first = re.match(r"([a-z]+)\s+(met|meet|visited)", text)
+    if first:
+        name = first.group(1).title()
+        if hcp and name.lower() not in hcp.lower():
+            attendees.append(name)
+
+    return list(set(attendees))
 
 
 def extract_datetime(text, data):
-    date_match = re.search(r"\b\d{2}-\d{2}-\d{4}\b", text)
-    if date_match:
-        data["date"] = date_match.group()
+    # 4-digit year
+    match1 = re.search(r"\d{2}/\d{2}/\d{4}", text)
+    # 2-digit year
+    match2 = re.search(r"\d{2}/\d{2}/\d{2}", text)
 
-    time_match = re.search(r"\b\d{1,2}[:.]\d{2}\s?(am|pm)?\b", text.lower())
-    if time_match:
-        data["time"] = time_match.group()
+    if match1:
+        data["date"] = match1.group()
+    elif match2:
+        data["date"] = match2.group()
+
+    time = re.search(r"\d{1,2}[:.]\d{2}\s?(am|pm)?", text.lower())
+    if time:
+        data["time"] = time.group()
 
     return data
 
+
+def classify_resources(text, data):
+    text = text.lower()
+
+    materials = []
+    samples = []
+
+    if "report" in text or "xray" in text or "brochure" in text:
+        materials.append("Report")
+
+    if "medicine" in text or "tablet" in text or "sample" in text:
+        samples.append("Medicine")
+
+    data["materials_shared"] = list(set(data.get("materials_shared", []) + materials))
+    data["samples"] = list(set(data.get("samples", []) + samples))
+
+    return data
 
 # =============================
 # LLM
@@ -105,9 +189,8 @@ def call_llm(prompt):
     )
     return response.choices[0].message.content
 
-
 # =============================
-# TOOL FUNCTIONS
+# TOOLS
 # =============================
 
 def log_tool(data):
@@ -115,238 +198,143 @@ def log_tool(data):
 
     for key, value in data.items():
 
-        if key in ["materials_shared", "samples"]:
+        # 🟢 HANDLE LIST FIELDS
+        if key in ["attendees", "materials_shared", "samples"]:
+            existing = GLOBAL_FORM.get(key, [])
+
+            if not isinstance(existing, list):
+                existing = []
+
             if isinstance(value, list):
-                existing = GLOBAL_FORM.get(key, [])
                 GLOBAL_FORM[key] = list(set(existing + value))
+
+        # 🟡 HANDLE STRING FIELDS
         else:
-            if value not in ["", [], None]:
+            if value:
                 GLOBAL_FORM[key] = value
 
-    # 🔥 AUTO AI INSIGHTS
+    # 🔥 sentiment
+    GLOBAL_FORM["sentiment"] = call_llm(f"""
+Return ONLY one word:
+positive OR neutral OR negative
 
-    GLOBAL_FORM["sentiment"] = call_llm(
-        f"Classify sentiment (positive, neutral, negative):\n{GLOBAL_FORM}"
-    )
+Text:
+{GLOBAL_FORM}
+""").strip().lower()
 
-    #GLOBAL_FORM["follow_up"] = call_llm(
-        #f"Suggest professional follow-up actions for this doctor interaction:\n{GLOBAL_FORM}"
-    #)
-
-    #GLOBAL_FORM["summary"] = call_llm(
-       # f"Write a clear professional summary of this healthcare interaction:\n{GLOBAL_FORM}"
-    #)
-
-    return {"status": "logged", "form_data": GLOBAL_FORM}
+    return {"status": "logged"}
 
 
 def edit_tool(data):
     global GLOBAL_FORM
 
     for key, value in data.items():
+        if not value:
+            continue
 
-        if key in ["materials_shared", "samples"]:
-            if isinstance(value, list):
-                existing = GLOBAL_FORM.get(key, [])
-                GLOBAL_FORM[key] = list(set(existing + value))
+        if key in ["attendees", "materials_shared", "samples"]:
+            GLOBAL_FORM[key] = value if isinstance(value, list) else [value]
         else:
-            if value not in ["", [], None]:
-                GLOBAL_FORM[key] = value
+            GLOBAL_FORM[key] = value
 
-    return {"status": "edited", "form_data": GLOBAL_FORM}
-
+    return {"status": "edited"}
 
 def summarize_tool():
     global GLOBAL_FORM
 
-    GLOBAL_FORM["summary"] = call_llm(
-        f"Write a professional summary of this interaction make it short and understanble to anyone Rules: -plain text only -no formating ,- no ** symbols make it proffessional Text:{GLOBAL_FORM}"
-    )
+    GLOBAL_FORM["summary"] = call_llm(f"""
+Write 2 line professional medical CRM summary.
+No symbols. No markdown.
 
-    return {"status": "summarized", "form_data": GLOBAL_FORM}
+Data:
+{GLOBAL_FORM}
+""").strip()
 
-
-def sentiment_tool(text):
-    global GLOBAL_FORM
-
-    GLOBAL_FORM["sentiment"] = call_llm(
-        f"Classify sentiment of this interaction. Return ONLY one word:positive OR neutral OR negative no explanation : Text: {GLOBAL_FORM}"
-    ).strip().lower()
-
-    return {"status": "sentiment_updated", "form_data": GLOBAL_FORM}
+    return {"status": "summarized"}
 
 
 def followup_tool():
     global GLOBAL_FORM
 
-    GLOBAL_FORM["follow_up"] = call_llm(
-        f"Suggest next steps for this interaction like short 3-4 proffesional follow-up action relevent Rules:-Bullet points only, -No explanation - no symbols like ** Text:{GLOBAL_FORM}"
-    )
+    GLOBAL_FORM["follow_up"] = call_llm(f"""
+Give 3 professional doctor follow-up actions.
+No symbols. Plain text.
 
-    return {"status": "followup_generated", "form_data": GLOBAL_FORM}
+Context:
+{GLOBAL_FORM}
+""")
 
+    return {"status": "followup"}
 
 # =============================
-# LANGGRAPH NODES
+# LANGGRAPH
 # =============================
 
 def decide_tool(state):
-    text = state["input"]
+    text = state["input"].lower()
 
-    prompt = f"""
-You are an AI assistant for a Healthcare CRM.
-
-Choose ONE tool:
-
-- log
-- edit
-- summarize
-- sentiment
-- followup
-
-You are an AI assistant for a Healthcare CRM system.
-
-Your task is to choose ONE tool based on the user's input.
-
-Available tools:
-- log → when user describes a meeting or interaction
-- edit → when user modifies existing data
-- summarize → when user asks for summary
-- sentiment → when user expresses opinion/emotion
-- followup → when user asks next steps
-
-Guidelines:
-- Mentions of doctors, meetings, medicines → log
-- Updates like "change", "update" → edit
-- "summarize" → summarize
-- emotional tone → sentiment
-- "next step" → followup
-
-Return ONLY one word from:
-log, edit, summarize, sentiment, followup
-
-Rules:
-- Meeting/doctor/medicine → log
-- change/update → edit
-- summary request → summarize
-- emotional tone → sentiment
-- next steps → followup
-- Medicines → samples
-- Documents → materials_shared
-- Return ONLY valid JSON
-- If not present → leave empty
-
-Text:
-{text}
-
-Return ONE word only.
-"""
-
-    tool = call_llm(prompt).strip().lower()
-
-    # ✅ Safety mapping
-    if "log" in tool:
-        tool = "log"
-    elif "edit" in tool:
-        tool = "edit"
-    elif "summar" in tool:
-        tool = "summarize"
-    elif "sentiment" in tool:
-        tool = "sentiment"
-    elif "follow" in tool:
-        tool = "followup"
+    if "summary" in text:
+        state["tool"] = "summarize"
+    elif "follow" in text:
+        state["tool"] = "followup"
+    elif "edit" in text or "change" in text:
+        state["tool"] = "edit"
     else:
-        tool = "log"
+        state["tool"] = "log"
 
-    state["tool"] = tool
     return state
 
 
 def extract_node(state):
     text = state["input"]
 
-    prompt = f"""
-Extract structured CRM data.
+    # LLM only for topics/outcomes
+    result = call_llm(f"""
+Extract ONLY:
+topics, outcomes
 
-Return ONLY JSON.
-
-Fields:
-hcp_name, attendees, topics, sentiment, outcomes, follow_up,
-materials_shared, samples
-
-You are an AI system extracting structured medical CRM interaction data.
-
-Extract the following fields from the text:
-
-- hcp_name (doctor name)
-- attendees (list of people)
-- topics (discussion topics)
-- sentiment (positive, neutral, negative)
-- outcomes
-- follow_up
-- materials_shared (documents like brochure, report, pdf)
-- samples (medicines/products)
-
-Rules:
-- Medicines → samples
-- Documents → materials_shared
-- Medicines → samples
-- Documents → materials_shared
-- Return ONLY valid JSON
-- If not present → leave empty
-
+Return JSON.
 
 Text:
 {text}
-"""
-
-    result = call_llm(prompt)
+""")
 
     try:
-        start = result.find("{")
-        end = result.rfind("}") + 1
-        data = json.loads(result[start:end])
+        data = json.loads(result[result.find("{"):result.rfind("}")+1])
     except:
         data = {}
 
-    data = normalize_attendees(data)
-    data["materials_shared"] = normalize_list(data.get("materials_shared"))
-    data["samples"] = normalize_list(data.get("samples"))
+    # RULE BASED (MAIN FIX)
+    hcp = extract_hcp(text)
+    if hcp:
+        data["hcp_name"] = hcp
+
+    data["attendees"] = extract_attendees(text, data.get("hcp_name"))
+
     data = extract_datetime(text, data)
+    data = classify_resources(text, data)
 
     state["data"] = data
     return state
 
 
 def tool_node(state):
-    tool = state.get("tool")
+    tool = state["tool"]
     data = state.get("data", {})
-    text = state.get("input")
 
     if tool == "log":
         return log_tool(data)
-
     elif tool == "edit":
         return edit_tool(data)
-
     elif tool == "summarize":
         return summarize_tool()
-
-    elif tool == "sentiment":
-        return sentiment_tool(text)
-
     elif tool == "followup":
         return followup_tool()
 
     return {"status": "no_action"}
 
 
-# =============================
-# GRAPH
-# =============================
-
 graph = StateGraph(dict)
-
 graph.add_node("decide", decide_tool)
 graph.add_node("extract", extract_node)
 graph.add_node("tool", tool_node)
@@ -357,7 +345,6 @@ graph.add_edge("extract", "tool")
 
 app_graph = graph.compile()
 
-
 # =============================
 # API
 # =============================
@@ -365,11 +352,13 @@ app_graph = graph.compile()
 @app.post("/chat")
 async def chat(req: ChatRequest):
     result = app_graph.invoke({"input": req.message})
+    return {"form_data": GLOBAL_FORM, "message": result["status"]}
 
-    return {
-        "form_data": GLOBAL_FORM,
-        "message": result.get("status", "done")
-    }
+
+@app.post("/save")
+async def save():
+    save_to_db(GLOBAL_FORM)
+    return {"message": "Saved to DB"}
 
 
 @app.post("/voice")
@@ -386,13 +375,9 @@ async def voice(file: UploadFile = File(...)):
             )
 
         text = transcription.text
+        app_graph.invoke({"input": text})
 
-        result = app_graph.invoke({"input": text})
-
-        return {
-            "form_data": GLOBAL_FORM,
-            "message": f"Voice processed"
-        }
+        return {"form_data": GLOBAL_FORM, "message": "Voice processed"}
 
     finally:
         os.remove(path)

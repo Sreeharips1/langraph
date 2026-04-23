@@ -92,9 +92,30 @@ export default function ChatSection() {
     }
   };
 
+  // 💾 SAVE BUTTON
+  const handleSave = async () => {
+    try {
+      await axios.post("http://localhost:8000/save");
+
+      setChat((prev) => [
+        ...prev,
+        { type: "bot", text: "✅ Interaction saved successfully" },
+      ]);
+    } catch (err) {
+      console.error(err);
+      setChat((prev) => [...prev, { type: "bot", text: "❌ Failed to save" }]);
+    }
+  };
+
   return (
     <div className="card">
       <div className="title">AI Assistant</div>
+
+      {/* 💡 SAMPLE TEXT */}
+      <div className="chat-hint">
+        💡 Example: John met Dr Isaac with friend Isaac and father James to
+        discuss tooth pain, shared report and gave sample medicine
+      </div>
 
       {/* CHAT DISPLAY */}
       <div className="chat-box">
@@ -116,13 +137,18 @@ export default function ChatSection() {
 
         <button onClick={() => sendMessage()}>Send</button>
 
-        {/* 🎤 Voice Buttons */}
+        {/* 🎤 Voice */}
         {!recording ? (
           <button onClick={startRecording}>🎤</button>
         ) : (
           <button onClick={stopRecording}>⏹</button>
         )}
       </div>
+
+      {/* 🔥 SAVE BUTTON */}
+      <button className="save-btn" onClick={handleSave}>
+        Save Interaction
+      </button>
     </div>
   );
 }
